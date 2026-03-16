@@ -40,6 +40,8 @@ services:
     container_name: cap-media-server
     image: ghcr.io/capsoftware/cap-media-server:latest
     restart: unless-stopped
+    labels:
+      - "traefik.enable=false"
     environment:
       PORT: 3456
     healthcheck:
