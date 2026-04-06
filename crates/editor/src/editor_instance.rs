@@ -83,11 +83,11 @@ pub struct EditorInstance {
         watch::Sender<ProjectConfiguration>,
         watch::Receiver<ProjectConfiguration>,
     ),
-    // ws_shutdown_token: CancellationToken,
     pub segment_medias: Arc<Vec<SegmentMedia>>,
     meta: RecordingMeta,
     pub export_preview_active: AtomicBool,
     pub export_active: AtomicBool,
+    runtime_handle: tokio::runtime::Handle,
 }
 
 impl EditorInstance {
@@ -201,6 +201,8 @@ impl EditorInstance {
                     scene_segments: Vec::new(),
                     mask_segments: Vec::new(),
                     text_segments: Vec::new(),
+                    caption_segments: Vec::new(),
+                    keyboard_segments: Vec::new(),
                 });
 
                 if let Err(e) = project.write(&recording_meta.project_path) {
@@ -304,6 +306,7 @@ impl EditorInstance {
             playback_active_rx,
             export_preview_active: AtomicBool::new(false),
             export_active: AtomicBool::new(false),
+            runtime_handle: tokio::runtime::Handle::current(),
         });
 
         this.state.lock().await.preview_task =
@@ -488,6 +491,7 @@ impl EditorInstance {
                                         .get_frames(
                                             prefetch_segment_time as f32,
                                             !hide_camera,
+                                            true,
                                             prefetch_clip_offsets,
                                         )
                                         .await;
@@ -506,6 +510,7 @@ impl EditorInstance {
                         segment_frames_opt = segment_medias.decoders.get_frames_initial(
                             segment_time as f32,
                             !project.camera.hide,
+                            true,
                             clip_offsets,
                         ) => {
                             if preview_rx.has_changed().unwrap_or(false) {
@@ -530,8 +535,10 @@ impl EditorInstance {
                                 let zoom_focus_interpolator = ZoomFocusInterpolator::new_arc(
                                     segment_medias.cursor.clone(),
                                     cursor_smoothing,
+                                    project.cursor.click_spring_config(),
                                     project.screen_movement_spring,
                                     total_duration,
+                                    project.timeline.as_ref().map(|t| t.zoom_segments.as_slice()).unwrap_or(&[]),
                                 );
 
                                 let uniforms = ProjectUniforms::new(
@@ -579,7 +586,29 @@ impl EditorInstance {
 }
 
 impl Drop for EditorInstance {
-    fn drop(&mut self) {}
+    fn drop(&mut self) {
+        let renderer = self.renderer.clone();
+        let state = self.state.clone();
+        let handle = self.runtime_handle.clone();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            handle.spawn(async move {
+                let mut state = state.lock().await;
+                if let Some(playback) = state.playback_task.take() {
+                    playback.stop();
+                }
+                if let Some(task) = state.preview_task.take() {
+                    task.abort();
+                }
+                drop(state);
+                renderer.stop().await;
+            });
+        }));
+
+        if result.is_err() {
+            tracing::warn!("EditorInstance cleanup skipped — runtime is no longer available");
+        }
+    }
 }
 
 type PreviewFrameInstruction = (u32, u32, XY<u32>);
@@ -594,6 +623,7 @@ pub struct SegmentMedia {
     pub audio: Option<Arc<AudioData>>,
     pub system_audio: Option<Arc<AudioData>>,
     pub cursor: Arc<CursorEvents>,
+    pub keyboard: Arc<cap_project::KeyboardEvents>,
     pub decoders: RecordingSegmentDecoders,
 }
 
@@ -651,6 +681,7 @@ pub async fn create_segments(
                 audio,
                 system_audio: None,
                 cursor,
+                keyboard: Arc::new(Default::default()),
                 decoders,
             }])
         }
@@ -693,10 +724,13 @@ pub async fn create_segments(
                 .await
                 .map_err(|e| format!("MultipleSegments {i} / {e}"))?;
 
+                let keyboard = Arc::new(s.keyboard_events(recording_meta));
+
                 segments.push(SegmentMedia {
                     audio,
                     system_audio,
                     cursor,
+                    keyboard,
                     decoders,
                 });
             }

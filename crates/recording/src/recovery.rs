@@ -6,6 +6,7 @@ use std::{
 use cap_enc_ffmpeg::remux::{
     concatenate_audio_to_ogg, concatenate_m4s_segments_with_init, concatenate_video_fragments,
     get_media_duration, get_video_fps, probe_media_valid, probe_video_can_decode,
+    probe_video_seek_points, remux_file,
 };
 use cap_project::{
     AudioMeta, Cursors, MultipleSegment, MultipleSegments, ProjectConfiguration, RecordingMeta,
@@ -67,7 +68,23 @@ pub enum RecoveryError {
 
 pub struct RecoveryManager;
 
+const EXPORT_SEEK_PROBE_SAMPLE_COUNT: usize = 8;
+
 impl RecoveryManager {
+    pub fn inspect_recording(project_path: &Path) -> Option<IncompleteRecording> {
+        if !project_path.is_dir() {
+            return None;
+        }
+
+        if !project_path.join("recording-meta.json").exists() {
+            return None;
+        }
+
+        let meta = RecordingMeta::load_for_project(project_path).ok()?;
+
+        Self::analyze_incomplete(project_path, &meta)
+    }
+
     pub fn find_incomplete_single(project_path: &Path) -> Option<IncompleteRecording> {
         if !project_path.is_dir() {
             return None;
@@ -255,6 +272,7 @@ impl RecoveryManager {
         use crate::fragmentation::CURRENT_MANIFEST_VERSION;
 
         let manifest_path = dir.join("manifest.json");
+        let mut manifest_init_segment = None;
 
         if manifest_path.exists()
             && let Ok(content) = std::fs::read_to_string(&manifest_path)
@@ -288,6 +306,7 @@ impl RecoveryManager {
                 .and_then(|i| i.as_str())
                 .map(|name| dir.join(name))
                 .filter(|p| p.exists());
+            manifest_init_segment = init_segment.clone();
 
             let entries = if manifest_type == "m4s_segments" {
                 manifest.get("segments").and_then(|s| s.as_array())
@@ -368,6 +387,16 @@ impl RecoveryManager {
             }
         }
 
+        if let Some(init_segment) = manifest_init_segment {
+            let fragments = Self::probe_m4s_fragments_with_init(dir);
+            if !fragments.is_empty() {
+                return FragmentsInfo {
+                    fragments,
+                    init_segment: Some(init_segment),
+                };
+            }
+        }
+
         FragmentsInfo {
             fragments: Self::probe_fragments_in_dir(dir),
             init_segment: None,
@@ -408,6 +437,28 @@ impl RecoveryManager {
                     Some("m4a") | Some("ogg") => probe_media_valid(p),
                     _ => false,
                 }
+            })
+            .collect();
+
+        fragments.sort();
+        fragments
+    }
+
+    fn probe_m4s_fragments_with_init(dir: &Path) -> Vec<PathBuf> {
+        const MIN_VALID_FRAGMENT_SIZE: u64 = 100;
+
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+
+        let mut fragments: Vec<_> = entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("m4s")))
+            .filter(|p| {
+                std::fs::metadata(p)
+                    .map(|metadata| metadata.len() >= MIN_VALID_FRAGMENT_SIZE)
+                    .unwrap_or(false)
             })
             .collect();
 
@@ -702,55 +753,22 @@ impl RecoveryManager {
 
             let display_output = segment_dir.join("display.mp4");
             if display_output.exists() {
-                info!("Validating recovered display video: {:?}", display_output);
-                match probe_video_can_decode(&display_output) {
-                    Ok(true) => {
-                        info!("Display video validation passed");
-                    }
-                    Ok(false) => {
-                        return Err(RecoveryError::UnplayableVideo(format!(
-                            "Display video has no decodable frames: {display_output:?}"
-                        )));
-                    }
-                    Err(e) => {
-                        return Err(RecoveryError::UnplayableVideo(format!(
-                            "Display video validation failed for {display_output:?}: {e}"
-                        )));
-                    }
-                }
+                Self::validate_required_video(&display_output, "display")?;
             }
 
             let camera_output = segment_dir.join("camera.mp4");
-            if camera_output.exists() {
-                info!("Validating recovered camera video: {:?}", camera_output);
-                match probe_video_can_decode(&camera_output) {
-                    Ok(true) => {
-                        info!("Camera video validation passed");
-                    }
-                    Ok(false) => {
-                        warn!(
-                            "Camera video has no decodable frames, removing: {:?}",
-                            camera_output
-                        );
-                        if let Err(e) = std::fs::remove_file(&camera_output) {
-                            debug!(
-                                "Failed to remove invalid camera video {:?}: {e}",
-                                camera_output
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Camera video validation failed for {:?}: {}, removing",
-                            camera_output, e
-                        );
-                        if let Err(remove_err) = std::fs::remove_file(&camera_output) {
-                            debug!(
-                                "Failed to remove invalid camera video {:?}: {remove_err}",
-                                camera_output
-                            );
-                        }
-                    }
+            if camera_output.exists()
+                && let Err(e) = Self::validate_required_video(&camera_output, "camera")
+            {
+                warn!(
+                    "Camera video validation failed for {:?}: {}",
+                    camera_output, e
+                );
+                if let Err(remove_err) = std::fs::remove_file(&camera_output) {
+                    debug!(
+                        "Failed to remove invalid camera video {:?}: {remove_err}",
+                        camera_output
+                    );
                 }
             }
         }
@@ -774,6 +792,60 @@ impl RecoveryManager {
             project_path: recording.project_path.clone(),
             meta,
         })
+    }
+
+    fn validate_required_video(path: &Path, label: &str) -> Result<(), RecoveryError> {
+        info!("Validating recovered {} video: {:?}", label, path);
+
+        Self::ensure_video_decodes(path, label)?;
+
+        if let Err(seek_error) = probe_video_seek_points(path, EXPORT_SEEK_PROBE_SAMPLE_COUNT) {
+            info!(
+                "Recovered {} video failed seek validation, normalizing via remux: {}",
+                label, seek_error
+            );
+            Self::normalize_recovered_video(path, label)?;
+        }
+
+        Ok(())
+    }
+
+    fn ensure_video_decodes(path: &Path, label: &str) -> Result<(), RecoveryError> {
+        match probe_video_can_decode(path) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(RecoveryError::UnplayableVideo(format!(
+                "{} video has no decodable frames: {path:?}",
+                label
+            ))),
+            Err(e) => Err(RecoveryError::UnplayableVideo(format!(
+                "{} video validation failed for {path:?}: {e}",
+                label
+            ))),
+        }
+    }
+
+    fn normalize_recovered_video(path: &Path, label: &str) -> Result<(), RecoveryError> {
+        let normalized_path = path.with_extension("normalized.mp4");
+
+        remux_file(path, &normalized_path).map_err(RecoveryError::VideoConcat)?;
+
+        replace_file(&normalized_path, path)?;
+
+        Self::ensure_video_decodes(path, label)?;
+
+        probe_video_seek_points(path, EXPORT_SEEK_PROBE_SAMPLE_COUNT).map_err(|e| {
+            RecoveryError::UnplayableVideo(format!(
+                "{} video seek validation failed for {path:?}: {e}",
+                label
+            ))
+        })?;
+
+        info!(
+            "Recovered {} video validation passed after normalization",
+            label
+        );
+
+        Ok(())
     }
 
     fn build_recovered_meta(
@@ -802,6 +874,14 @@ impl RecoveryManager {
                 let mic_path = segment_dir.join("audio-input.ogg");
                 let system_audio_path = segment_dir.join("system_audio.ogg");
                 let cursor_path = segment_dir.join("cursor.json");
+                let keyboard_path = {
+                    let binary = segment_dir.join(cap_project::KEYBOARD_EVENTS_FILE_NAME);
+                    if binary.exists() {
+                        binary
+                    } else {
+                        segment_dir.join(cap_project::LEGACY_KEYBOARD_EVENTS_FILE_NAME)
+                    }
+                };
 
                 let display_start_time = original_segment.and_then(|s| s.display.start_time);
 
@@ -884,6 +964,16 @@ impl RecoveryManager {
                     } else {
                         None
                     },
+                    keyboard: if keyboard_path.exists() {
+                        keyboard_path.file_name().map(|file_name| {
+                            RelativePathBuf::from(format!(
+                                "{segment_base}/{}",
+                                file_name.to_string_lossy()
+                            ))
+                        })
+                    } else {
+                        None
+                    },
                 }
             })
             .collect();
@@ -952,6 +1042,8 @@ impl RecoveryManager {
             scene_segments: Vec::new(),
             mask_segments: Vec::new(),
             text_segments: Vec::new(),
+            caption_segments: Vec::new(),
+            keyboard_segments: Vec::new(),
         });
 
         config
@@ -1072,5 +1164,35 @@ impl RecoveryManager {
                 );
             }
         }
+    }
+}
+
+fn replace_file(src: &Path, dst: &Path) -> Result<(), RecoveryError> {
+    if dst.exists() {
+        std::fs::remove_file(dst).map_err(RecoveryError::Io)?;
+    }
+
+    std::fs::rename(src, dst).map_err(RecoveryError::Io)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::replace_file;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn replace_file_overwrites_existing_destination() {
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("source.tmp");
+        let dst = dir.path().join("destination.mp4");
+
+        fs::write(&src, b"new").unwrap();
+        fs::write(&dst, b"old").unwrap();
+
+        replace_file(&src, &dst).unwrap();
+
+        assert_eq!(fs::read(&dst).unwrap(), b"new");
+        assert!(!src.exists());
     }
 }

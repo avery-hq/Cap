@@ -1,5 +1,6 @@
 import type { RouteSectionProps } from "@solidjs/router";
 import type { UnlistenFn } from "@tauri-apps/api/event";
+import { emit } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { type as ostype } from "@tauri-apps/plugin-os";
 import { cx } from "cva";
@@ -20,10 +21,18 @@ export default function (props: RouteSectionProps) {
 	onMount(async () => {
 		console.log("window chrome mounted");
 		unlistenResize = await initializeTitlebar();
-		const capContext = (window as any).__CAP__;
-		const hasInitialTargetMode = capContext?.initialTargetMode != null;
-		if (location.pathname === "/" && !hasInitialTargetMode)
-			getCurrentWindow().show();
+		const { __CAP__ } = window as typeof window & {
+			__CAP__?: { initialTargetMode?: unknown };
+		};
+		const hasInitialTargetMode = __CAP__?.initialTargetMode != null;
+		const currentWindow = getCurrentWindow();
+		if (location.pathname === "/") {
+			void emit("main-window-ready");
+		}
+		if (location.pathname === "/" && !hasInitialTargetMode) {
+			await currentWindow.show();
+			await currentWindow.setFocus();
+		}
 	});
 
 	onCleanup(() => {
@@ -50,25 +59,9 @@ export default function (props: RouteSectionProps) {
         enterClass="opacity-0"
         exitToClass="opacity-0"
         > */}
-				<Suspense
-					fallback={
-						(() => {
-							console.log("Outer window chrome suspense fallback");
-							return <AbsoluteInsetLoader />;
-						}) as any
-					}
-				>
+				<Suspense fallback={<AbsoluteInsetLoader />}>
 					<Inner>
-						{/* prevents flicker idk */}
-						<Suspense
-							fallback={
-								(() => {
-									console.log("Inner window chrome suspense fallback");
-								}) as any
-							}
-						>
-							{props.children}
-						</Suspense>
+						<Suspense fallback={null}>{props.children}</Suspense>
 					</Inner>
 				</Suspense>
 				{/* </Transition> */}
@@ -78,7 +71,11 @@ export default function (props: RouteSectionProps) {
 }
 
 function Header() {
-	const ctx = useWindowChromeContext()!;
+	const ctx = useWindowChromeContext();
+	if (!ctx)
+		throw new Error(
+			"useWindowChrome must be used within a WindowChromeContext",
+		);
 
 	const isWindows = ostype() === "windows";
 	const isMacOS = ostype() === "macos";
@@ -86,7 +83,7 @@ function Header() {
 	return (
 		<header
 			class={cx(
-				"flex items-center h-9 select-none shrink-0 bg-gray-2",
+				"flex items-center min-w-0 w-full h-9 select-none shrink-0 bg-gray-2",
 				isWindows ? "flex-row" : "flex-row-reverse",
 			)}
 			data-tauri-drag-region
@@ -110,7 +107,10 @@ function Inner(props: ParentProps) {
 	});
 
 	return (
-		<div class="flex overflow-y-hidden flex-col flex-1 animate-in fade-in">
+		<div
+			data-tauri-drag-region="none"
+			class="flex overflow-y-hidden flex-col flex-1 animate-in fade-in"
+		>
 			{props.children}
 		</div>
 	);

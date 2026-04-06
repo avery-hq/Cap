@@ -129,17 +129,33 @@ impl DecoderPoolManager {
         self.reposition_threshold
     }
 
-    pub fn find_best_decoder_for_time(&mut self, requested_time: f32) -> (usize, f32, bool) {
+    const MAX_ACCESS_HISTORY_ENTRIES: usize = 10_000;
+
+    pub fn find_best_decoder_for_time(
+        &mut self,
+        requested_time: f32,
+        decoder_count: usize,
+    ) -> (usize, f32, bool) {
         self.total_accesses += 1;
 
         let frame = (requested_time * self.config.fps as f32).floor() as u32;
         *self.access_history.entry(frame).or_insert(0) += 1;
 
+        if self.access_history.len() > Self::MAX_ACCESS_HISTORY_ENTRIES {
+            let threshold = self.access_history.values().copied().sum::<u64>()
+                / self.access_history.len() as u64;
+            self.access_history.retain(|_, count| *count > threshold);
+        }
+
         let mut best_decoder_id = 0;
         let mut best_distance = f32::MAX;
         let mut needs_reset = true;
 
-        for position in &self.positions {
+        if decoder_count == 0 {
+            return (0, f32::MAX, true);
+        }
+
+        for position in self.positions.iter().filter(|p| p.id < decoder_count) {
             let distance = (position.position_secs - requested_time).abs();
             let is_usable = position.position_secs <= requested_time
                 && (requested_time - position.position_secs) < self.reposition_threshold;
@@ -152,7 +168,7 @@ impl DecoderPoolManager {
         }
 
         if needs_reset {
-            for position in &self.positions {
+            for position in self.positions.iter().filter(|p| p.id < decoder_count) {
                 let distance = (position.position_secs - requested_time).abs();
                 if distance < best_distance {
                     best_distance = distance;
