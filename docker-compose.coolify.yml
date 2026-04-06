@@ -3,7 +3,7 @@ name: cap
 services:
   cap-web:
     container_name: cap-web
-    image: ghcr.io/capsoftware/cap-web:latest
+    image: ghcr.io/avery-hq/cap-web:latest
     restart: unless-stopped
     depends_on:
       mysql:
@@ -38,7 +38,7 @@ services:
 
   media-server:
     container_name: cap-media-server
-    image: ghcr.io/capsoftware/cap-media-server:latest
+    image: ghcr.io/avery-hq/cap-media-server:latest
     restart: unless-stopped
     labels:
       - "traefik.enable=false"
