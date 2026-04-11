@@ -178,13 +178,32 @@ export default async function EmbedVideoPage(
 			</div>
 		)),
 		Effect.catchTags({
-			PolicyDenied: () =>
+			PolicyDenied: (e) =>
 				Effect.succeed(
 					<div className="flex flex-col justify-center items-center min-h-screen text-center text-white bg-black">
-						<h1 className="mb-4 text-2xl font-bold">This video is private</h1>
+						<h1 className="mb-4 text-2xl font-bold">
+							{e.reason === "email_restriction_login_required"
+								? "Sign in required"
+								: "This video is private"}
+						</h1>
 						<p className="text-gray-400">
-							If you own this video, please <Link href="/login">sign in</Link>{" "}
-							to manage sharing.
+							{e.reason === "email_restriction_login_required" ? (
+								<>
+									The owner has restricted access. Please{" "}
+									<Link href="/login" target="_top">
+										sign in
+									</Link>{" "}
+									with an authorized email to view.
+								</>
+							) : (
+								<>
+									If you own this video, please{" "}
+									<Link href="/login" target="_top">
+										sign in
+									</Link>{" "}
+									to manage sharing.
+								</>
+							)}
 						</p>
 					</div>,
 				),
